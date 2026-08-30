@@ -5972,3 +5972,636 @@ fn test_midflight_fee_change_does_not_alter_collected_fees() {
     });
     assert_eq!(collected_after, collected_before);
 }
+
+// ── Giveaway View Functions Tests ─────────────────────────────────────────────
+
+#[test]
+fn test_get_giveaway_returns_giveaway_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(GiveawayContract, ());
+    let client = GiveawayContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let mock_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &mock_token);
+
+    let creator = Address::generate(&env);
+    token_admin_client.mint(&creator, &1000);
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedToken(mock_token.clone()), &true);
+    });
+
+    let title = String::from_str(&env, "View Test Giveaway");
+    let amount = 500;
+    let duration = 60;
+    let winner_count = 2;
+
+    let giveaway_id = client.create_giveaway(
+        &creator,
+        &mock_token,
+        &amount,
+        &title,
+        &duration,
+        &winner_count,
+        &None,
+        &None,
+    );
+
+    // Test get_giveaway returns correct data
+    let giveaway_opt = client.get_giveaway(&giveaway_id);
+    assert!(giveaway_opt.is_some());
+
+    let giveaway = giveaway_opt.unwrap();
+    assert_eq!(giveaway.id, giveaway_id);
+    assert_eq!(giveaway.creator, creator);
+    assert_eq!(giveaway.token, mock_token);
+    assert_eq!(giveaway.amount, amount);
+    assert_eq!(giveaway.title, title);
+    assert_eq!(giveaway.winner_count, winner_count);
+    assert_eq!(giveaway.status, GiveawayStatus::Active);
+    assert_eq!(giveaway.participant_count, 0);
+}
+
+#[test]
+fn test_get_giveaway_returns_none_for_nonexistent_id() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(GiveawayContract, ());
+    let client = GiveawayContractClient::new(&env, &contract_id);
+
+    // Query non-existent giveaway
+    let giveaway_opt = client.get_giveaway(&999);
+    assert!(giveaway_opt.is_none());
+}
+
+#[test]
+fn test_get_winners_returns_empty_vec_before_selection() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_contract_id, client, _tc, token, creator) = setup_giveaway_env(&env, 100);
+
+    let giveaway_id = client.create_giveaway(
+        &creator,
+        &token,
+        &500,
+        &String::from_str(&env, "Winners Test"),
+        &60,
+        &2,
+        &None,
+        &None,
+    );
+
+    // Before winner selection
+    let winners = client.get_winners(&giveaway_id);
+    assert_eq!(winners.len(), 0);
+}
+
+#[test]
+fn test_get_winners_returns_winners_after_selection() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_contract_id, client, _tc, token, creator) = setup_giveaway_env(&env, 100);
+
+    let giveaway_id = client.create_giveaway(
+        &creator,
+        &token,
+        &500,
+        &String::from_str(&env, "Winners Test"),
+        &60,
+        &2,
+        &None,
+        &None,
+    );
+
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let p3 = Address::generate(&env);
+    client.enter_giveaway(&p1, &giveaway_id);
+    client.enter_giveaway(&p2, &giveaway_id);
+    client.enter_giveaway(&p3, &giveaway_id);
+
+    env.ledger().with_mut(|li| li.timestamp += 100);
+    client.pick_winner(&giveaway_id);
+
+    // After winner selection
+    let winners = client.get_winners(&giveaway_id);
+    assert_eq!(winners.len(), 2);
+    assert!(winners.iter().any(|w| w == p1 || w == p2 || w == p3));
+}
+
+#[test]
+fn test_get_winners_returns_empty_for_nonexistent_giveaway() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(GiveawayContract, ());
+    let client = GiveawayContractClient::new(&env, &contract_id);
+
+    // Query non-existent giveaway
+    let winners = client.get_winners(&999);
+    assert_eq!(winners.len(), 0);
+}
+
+#[test]
+fn test_get_participants_returns_all_entrants() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_contract_id, client, _tc, token, creator) = setup_giveaway_env(&env, 100);
+
+    let giveaway_id = client.create_giveaway(
+        &creator,
+        &token,
+        &500,
+        &String::from_str(&env, "Participants Test"),
+        &60,
+        &1,
+        &None,
+        &None,
+    );
+
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let p3 = Address::generate(&env);
+    client.enter_giveaway(&p1, &giveaway_id);
+    client.enter_giveaway(&p2, &giveaway_id);
+    client.enter_giveaway(&p3, &giveaway_id);
+
+    let participants = client.get_participants(&giveaway_id);
+    assert_eq!(participants.len(), 3);
+    assert_eq!(participants.get(0).unwrap(), p1);
+    assert_eq!(participants.get(1).unwrap(), p2);
+    assert_eq!(participants.get(2).unwrap(), p3);
+}
+
+#[test]
+fn test_get_participants_returns_empty_for_no_entries() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_contract_id, client, _tc, token, creator) = setup_giveaway_env(&env, 100);
+
+    let giveaway_id = client.create_giveaway(
+        &creator,
+        &token,
+        &500,
+        &String::from_str(&env, "No Participants"),
+        &60,
+        &1,
+        &None,
+        &None,
+    );
+
+    let participants = client.get_participants(&giveaway_id);
+    assert_eq!(participants.len(), 0);
+}
+
+#[test]
+fn test_get_participants_returns_empty_for_nonexistent_giveaway() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(GiveawayContract, ());
+    let client = GiveawayContractClient::new(&env, &contract_id);
+
+    let participants = client.get_participants(&999);
+    assert_eq!(participants.len(), 0);
+}
+
+#[test]
+fn test_has_claimed_returns_false_before_claim() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_contract_id, client, _tc, token, creator) = setup_giveaway_env(&env, 100);
+
+    let giveaway_id = client.create_giveaway(
+        &creator,
+        &token,
+        &500,
+        &String::from_str(&env, "Claim Test"),
+        &60,
+        &1,
+        &None,
+        &None,
+    );
+
+    let winner = Address::generate(&env);
+    client.enter_giveaway(&winner, &giveaway_id);
+    env.ledger().with_mut(|li| li.timestamp += 100);
+    client.pick_winner(&giveaway_id);
+
+    // Before claim
+    assert!(!client.has_claimed(&giveaway_id, &winner));
+}
+
+#[test]
+fn test_has_claimed_returns_true_after_claim() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_contract_id, client, _tc, token, creator) = setup_giveaway_env(&env, 100);
+
+    let giveaway_id = client.create_giveaway(
+        &creator,
+        &token,
+        &500,
+        &String::from_str(&env, "Claim Test"),
+        &60,
+        &1,
+        &None,
+        &None,
+    );
+
+    let winner = Address::generate(&env);
+    client.enter_giveaway(&winner, &giveaway_id);
+    env.ledger().with_mut(|li| li.timestamp += 100);
+    client.pick_winner(&giveaway_id);
+    client.claim_prize(&giveaway_id, &winner);
+
+    // After claim
+    assert!(client.has_claimed(&giveaway_id, &winner));
+}
+
+#[test]
+fn test_has_claimed_returns_false_for_nonexistent_giveaway() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(GiveawayContract, ());
+    let client = GiveawayContractClient::new(&env, &contract_id);
+
+    let address = Address::generate(&env);
+    assert!(!client.has_claimed(&999, &address));
+}
+
+#[test]
+fn test_has_claimed_returns_false_for_non_winner() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_contract_id, client, _tc, token, creator) = setup_giveaway_env(&env, 100);
+
+    let giveaway_id = client.create_giveaway(
+        &creator,
+        &token,
+        &500,
+        &String::from_str(&env, "Claim Test"),
+        &60,
+        &1,
+        &None,
+        &None,
+    );
+
+    let winner = Address::generate(&env);
+    let non_winner = Address::generate(&env);
+    client.enter_giveaway(&winner, &giveaway_id);
+    env.ledger().with_mut(|li| li.timestamp += 100);
+    client.pick_winner(&giveaway_id);
+
+    assert!(!client.has_claimed(&giveaway_id, &non_winner));
+}
+
+// ── Mutual Aid View Functions Tests ───────────────────────────────────────────
+
+#[test]
+fn test_get_donation_returns_zero_for_no_donation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MutualAidContract, ());
+    let client = MutualAidContractClient::new(&env, &contract_id);
+
+    let donor = Address::generate(&env);
+    let request_id = 1;
+
+    let donation = client.get_donation(&request_id, &donor);
+    assert_eq!(donation, 0);
+}
+
+#[test]
+fn test_get_donation_returns_amount_after_donation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MutualAidContract, ());
+    let client = MutualAidContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let mock_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &mock_token);
+
+    let creator = Address::generate(&env);
+    let donor = Address::generate(&env);
+    token_admin_client.mint(&donor, &1000);
+
+    let request_id = 1;
+    let goal = 500;
+    client.post_help_request(&creator, &request_id, &goal, &mock_token);
+
+    let donation_amount = 100;
+    client.donate(&donor, &request_id, &donation_amount);
+
+    let donation = client.get_donation(&request_id, &donor);
+    assert_eq!(donation, donation_amount);
+}
+
+#[test]
+fn test_get_donation_accumulates_multiple_donations() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MutualAidContract, ());
+    let client = MutualAidContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let mock_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &mock_token);
+
+    let creator = Address::generate(&env);
+    let donor = Address::generate(&env);
+    token_admin_client.mint(&donor, &1000);
+
+    let request_id = 1;
+    let goal = 500;
+    client.post_help_request(&creator, &request_id, &goal, &mock_token);
+
+    client.donate(&donor, &request_id, &100);
+    client.donate(&donor, &request_id, &50);
+
+    let donation = client.get_donation(&request_id, &donor);
+    assert_eq!(donation, 150);
+}
+
+#[test]
+fn test_has_claimed_funds_returns_false_before_claim() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MutualAidContract, ());
+    let client = MutualAidContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let mock_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &mock_token);
+
+    let creator = Address::generate(&env);
+    let donor = Address::generate(&env);
+    token_admin_client.mint(&donor, &1000);
+
+    let request_id = 1;
+    let goal = 100;
+    client.post_help_request(&creator, &request_id, &goal, &mock_token);
+    client.donate(&donor, &request_id, &goal);
+
+    assert!(!client.has_claimed_funds(&request_id));
+}
+
+#[test]
+fn test_has_claimed_funds_returns_true_after_claim() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MutualAidContract, ());
+    let client = MutualAidContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let mock_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &mock_token);
+
+    let creator = Address::generate(&env);
+    let donor = Address::generate(&env);
+    token_admin_client.mint(&donor, &1000);
+
+    let request_id = 1;
+    let goal = 100;
+    client.post_help_request(&creator, &request_id, &goal, &mock_token);
+    client.donate(&donor, &request_id, &goal);
+    client.claim_help_request_funds(&creator, &request_id);
+
+    assert!(client.has_claimed_funds(&request_id));
+}
+
+// ── Admin View Functions Tests ────────────────────────────────────────────────
+
+#[test]
+fn test_get_admin_returns_none_before_init() {
+    let env = Env::default();
+
+    let contract_id = env.register(AdminContract, ());
+    let client = AdminContractClient::new(&env, &contract_id);
+
+    let admin_opt = client.get_admin();
+    assert!(admin_opt.is_none());
+}
+
+#[test]
+fn test_get_admin_returns_admin_after_init() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AdminContract, ());
+    let client = AdminContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    });
+
+    let admin_opt = client.get_admin();
+    assert!(admin_opt.is_some());
+    assert_eq!(admin_opt.unwrap(), admin);
+}
+
+#[test]
+fn test_get_fee_returns_none_before_init() {
+    let env = Env::default();
+
+    let contract_id = env.register(AdminContract, ());
+    let client = AdminContractClient::new(&env, &contract_id);
+
+    let fee_opt = client.get_fee();
+    assert!(fee_opt.is_none());
+}
+
+#[test]
+fn test_get_fee_returns_fee_after_set() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AdminContract, ());
+    let client = AdminContractClient::new(&env, &contract_id);
+
+    let fee_bps = 100u32;
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Fee, &fee_bps);
+    });
+
+    let fee_opt = client.get_fee();
+    assert!(fee_opt.is_some());
+    assert_eq!(fee_opt.unwrap(), fee_bps);
+}
+
+#[test]
+fn test_get_token_fee_returns_none_if_not_set() {
+    let env = Env::default();
+
+    let contract_id = env.register(AdminContract, ());
+    let client = AdminContractClient::new(&env, &contract_id);
+
+    let token = Address::generate(&env);
+    let fee_opt = client.get_token_fee(&token);
+    assert!(fee_opt.is_none());
+}
+
+#[test]
+fn test_get_token_fee_returns_fee_after_set() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AdminContract, ());
+    let client = AdminContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let fee_bps = 200u32;
+
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    });
+
+    client.set_token_fee(&token, &fee_bps);
+
+    let fee_opt = client.get_token_fee(&token);
+    assert!(fee_opt.is_some());
+    assert_eq!(fee_opt.unwrap(), fee_bps);
+}
+
+#[test]
+fn test_is_token_allowed_returns_false_if_not_set() {
+    let env = Env::default();
+
+    let contract_id = env.register(AdminContract, ());
+    let client = AdminContractClient::new(&env, &contract_id);
+
+    let token = Address::generate(&env);
+    assert!(!client.is_token_allowed(&token));
+}
+
+#[test]
+fn test_is_token_allowed_returns_true_after_add() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AdminContract, ());
+    let client = AdminContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    });
+
+    client.add_token(&token);
+
+    assert!(client.is_token_allowed(&token));
+}
+
+#[test]
+fn test_is_token_allowed_returns_false_after_remove() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AdminContract, ());
+    let client = AdminContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    });
+
+    client.add_token(&token);
+    assert!(client.is_token_allowed(&token));
+
+    client.remove_token(&token);
+    assert!(!client.is_token_allowed(&token));
+}
+
+#[test]
+fn test_get_collected_fees_returns_zero_if_not_set() {
+    let env = Env::default();
+
+    let contract_id = env.register(AdminContract, ());
+    let client = AdminContractClient::new(&env, &contract_id);
+
+    let token = Address::generate(&env);
+    let fees = client.get_collected_fees(&token);
+    assert_eq!(fees, 0);
+}
+
+#[test]
+fn test_get_collected_fees_returns_amount_after_collection() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(GiveawayContract, ());
+    let client = GiveawayContractClient::new(&env, &contract_id);
+    let admin_client = AdminContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let mock_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &mock_token);
+
+    let creator = Address::generate(&env);
+    let winner = Address::generate(&env);
+    token_admin_client.mint(&creator, &1000);
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedToken(mock_token.clone()), &true);
+        env.storage().instance().set(&DataKey::Fee, &100u32); // 1% fee
+    });
+
+    let giveaway_id = client.create_giveaway(
+        &creator,
+        &mock_token,
+        &500,
+        &String::from_str(&env, "Fee Collection Test"),
+        &60,
+        &1,
+        &None,
+        &None,
+    );
+
+    client.enter_giveaway(&winner, &giveaway_id);
+    env.ledger().with_mut(|li| li.timestamp += 100);
+    client.pick_winner(&giveaway_id);
+    client.claim_prize(&giveaway_id, &winner);
+
+    let collected_fees = admin_client.get_collected_fees(&mock_token);
+    assert_eq!(collected_fees, 5); // 1% of 500
+}

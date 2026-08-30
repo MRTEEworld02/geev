@@ -801,4 +801,66 @@ impl GiveawayContract {
         );
         Self::finalize_winners(&env, &giveaway_key, giveaway, winners)
     }
+
+    // ── View Functions ────────────────────────────────────────────────────────
+
+    /// Read the full giveaway state for a given ID.
+    /// Returns `None` if the giveaway does not exist.
+    pub fn get_giveaway(env: Env, giveaway_id: u64) -> Option<Giveaway> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Giveaway(giveaway_id))
+    }
+
+    /// Read the list of winners for a giveaway.
+    /// Returns an empty `Vec` if the giveaway does not exist or has no winners yet.
+    pub fn get_winners(env: Env, giveaway_id: u64) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Giveaway>(&DataKey::Giveaway(giveaway_id))
+            .map(|g| g.winners)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Read the full list of participants who entered a giveaway.
+    /// Returns an empty `Vec` if the giveaway does not exist or has no participants.
+    pub fn get_participants(env: Env, giveaway_id: u64) -> Vec<Address> {
+        let giveaway: Option<Giveaway> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Giveaway(giveaway_id));
+
+        match giveaway {
+            Some(g) => {
+                let mut participants = Vec::new(&env);
+                for i in 0..g.participant_count {
+                    let participant_key = DataKey::ParticipantIndex(giveaway_id, i);
+                    if let Some(participant) = env.storage().persistent().get(&participant_key) {
+                        participants.push_back(participant);
+                    }
+                }
+                participants
+            }
+            None => Vec::new(&env),
+        }
+    }
+
+    /// Check whether a specific winner has claimed their prize.
+    /// Returns `false` if the giveaway does not exist, the address is not a winner,
+    /// or the winner has not yet claimed.
+    pub fn has_claimed(env: Env, giveaway_id: u64, winner: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Claimed(giveaway_id, winner))
+            .unwrap_or(false)
+    }
+
+    /// Read the accumulated fees collected for a specific token.
+    /// Returns 0 if no fees have been collected.
+    pub fn get_collected_fees(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CollectedFees(token))
+            .unwrap_or(0)
+    }
 }

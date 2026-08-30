@@ -121,6 +121,197 @@ Allow a selected winner to claim their prize share while the giveaway is
 - Claim window must not have expired
 
 **Returns:** (void — transfers net prize after fee)
+
+### View Functions
+
+#### Giveaway Module
+
+##### `get_giveaway`
+Retrieve the full giveaway state by ID.
+
+**Parameters:**
+- `giveaway_id: u64` - ID of the giveaway
+
+**Returns:** `Option<Giveaway>` - Complete giveaway data or `None` if not found
+
+**Example:**
+```rust
+let giveaway = GiveawayContract::get_giveaway(env, giveaway_id);
+if let Some(g) = giveaway {
+    // Access g.status, g.winner_count, g.amount, etc.
+}
+```
+
+##### `get_winners`
+Read the list of selected winners for a giveaway.
+
+**Parameters:**
+- `giveaway_id: u64` - ID of the giveaway
+
+**Returns:** `Vec<Address>` - List of winner addresses (empty if giveaway not found or no winners yet)
+
+**Example:**
+```rust
+let winners = GiveawayContract::get_winners(env, giveaway_id);
+for winner in winners.iter() {
+    // Process each winner
+}
+```
+
+##### `get_participants`
+Read all participants who entered a giveaway, in registration order.
+
+**Parameters:**
+- `giveaway_id: u64` - ID of the giveaway
+
+**Returns:** `Vec<Address>` - List of participant addresses (empty if giveaway not found or no participants)
+
+**Example:**
+```rust
+let participants = GiveawayContract::get_participants(env, giveaway_id);
+// participants[0] is the first entrant, participants[1] is the second, etc.
+```
+
+##### `has_claimed`
+Check whether a specific winner has claimed their prize.
+
+**Parameters:**
+- `giveaway_id: u64` - ID of the giveaway
+- `winner: Address` - Winner address to check
+
+**Returns:** `bool` - `true` if claimed, `false` if not claimed, not a winner, or giveaway not found
+
+**Example:**
+```rust
+if GiveawayContract::has_claimed(env, giveaway_id, winner.clone()) {
+    // Winner has already claimed
+} else {
+    // Winner can still claim (if they are a winner)
+}
+```
+
+#### Mutual Aid Module
+
+##### `get_request`
+Retrieve a help request by ID.
+
+**Parameters:**
+- `request_id: u64` - ID of the help request
+
+**Returns:** `Option<HelpRequest>` - Help request data or `None` if not found
+
+##### `get_donation`
+Read the total donation amount from a specific donor for a help request.
+
+**Parameters:**
+- `request_id: u64` - ID of the help request
+- `donor: Address` - Donor address
+
+**Returns:** `i128` - Total donation amount (0 if no donation or already refunded)
+
+**Example:**
+```rust
+let amount = MutualAidContract::get_donation(env, request_id, donor.clone());
+```
+
+##### `has_claimed_funds`
+Check whether a help request creator has claimed the raised funds.
+
+**Parameters:**
+- `request_id: u64` - ID of the help request
+
+**Returns:** `bool` - `true` if funds claimed, `false` otherwise
+
+#### Admin Module
+
+##### `get_admin`
+Read the current admin address.
+
+**Returns:** `Option<Address>` - Admin address or `None` if not initialized
+
+##### `get_fee`
+Read the global protocol fee in basis points.
+
+**Returns:** `Option<u32>` - Fee in bps or `None` if not set
+
+##### `get_token_fee`
+Read the per-token fee override in basis points.
+
+**Parameters:**
+- `token: Address` - Token address
+
+**Returns:** `Option<u32>` - Token-specific fee in bps or `None` if not set
+
+##### `is_token_allowed`
+Check whether a token is whitelisted for giveaway creation.
+
+**Parameters:**
+- `token: Address` - Token address to check
+
+**Returns:** `bool` - `true` if whitelisted, `false` otherwise
+
+**Example:**
+```rust
+if AdminContract::is_token_allowed(env, token.clone()) {
+    // Token can be used for giveaways
+}
+```
+
+##### `get_collected_fees`
+Read accumulated fees collected for a specific token.
+
+**Parameters:**
+- `token: Address` - Token address
+
+**Returns:** `i128` - Total fees collected (0 if none)
+
+#### Profile Module
+
+##### `get_profile`
+Retrieve profile data for a wallet address.
+
+**Parameters:**
+- `user: Address` - User address
+
+**Returns:** `Option<ProfileData>` - Profile data or `None` if not registered
+
+##### `resolve_username`
+Resolve a username to its owner's address.
+
+**Parameters:**
+- `username: String` - Username to resolve
+
+**Returns:** `Option<Address>` - Owner address or `None` if username not registered
+
+##### `get_reputation`
+Read the reputation score for an address (applies decay-on-read).
+
+**Parameters:**
+- `user: Address` - User address
+
+**Returns:** `u64` - Reputation score (0 if not set)
+
+#### Governance Module
+
+##### `get_flag_count`
+Read the total number of flags for a content item.
+
+**Parameters:**
+- `content_type: ContentType` - Type of content (Giveaway or HelpRequest)
+- `target_id: u64` - Content ID
+
+**Returns:** `u32` - Total flag count
+
+##### `has_flagged`
+Check whether a user has already flagged a specific content item.
+
+**Parameters:**
+- `user: Address` - User address
+- `content_type: ContentType` - Type of content
+- `target_id: u64` - Content ID
+
+**Returns:** `bool` - `true` if user has flagged, `false` otherwise
+
 ### `get_giveaway`
 Retrieve giveaway details by ID.
 

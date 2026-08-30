@@ -295,4 +295,23 @@ impl MutualAidContract {
         }
         .publish(&env);
     }
+
+    // ── View Functions ────────────────────────────────────────────────────────
+
+    /// Read the donation amount from a specific donor for a given help request.
+    /// Returns 0 if no donation was made or if the refund was already claimed.
+    pub fn get_donation(env: Env, request_id: u64, donor: Address) -> i128 {
+        let donation_key = DataKey::Donation(request_id, donor);
+        env.storage().persistent().get(&donation_key).unwrap_or(0)
+    }
+
+    /// Check whether a help request's funds have been claimed by the creator.
+    /// Returns `false` if the request does not exist or funds have not been claimed.
+    pub fn has_claimed_funds(env: Env, request_id: u64) -> bool {
+        let claimed_key = DataKey::HelpRequestClaimed(request_id);
+        env.storage()
+            .persistent()
+            .get(&claimed_key)
+            .unwrap_or(false)
+    }
 }

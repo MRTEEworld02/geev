@@ -256,4 +256,42 @@ impl AdminContract {
             .instance()
             .set(&DataKey::TokenFee(token), &fee_bps);
     }
+
+    // ── View Functions ────────────────────────────────────────────────────────
+
+    /// Read the current admin address.
+    /// Returns `None` if the contract has not been initialized.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    /// Read the global protocol fee in basis points.
+    /// Returns `None` if not set (typically after init).
+    pub fn get_fee(env: Env) -> Option<u32> {
+        env.storage().instance().get(&DataKey::Fee)
+    }
+
+    /// Read the per-token fee override in basis points.
+    /// Returns `None` if no override is set for this token.
+    pub fn get_token_fee(env: Env, token: Address) -> Option<u32> {
+        env.storage().instance().get(&DataKey::TokenFee(token))
+    }
+
+    /// Check whether a token is whitelisted for giveaway creation.
+    /// Returns `false` if the token is not allowed or not set.
+    pub fn is_token_allowed(env: Env, token: Address) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllowedToken(token))
+            .unwrap_or(false)
+    }
+
+    /// Read the accumulated fees collected for a specific token.
+    /// Returns 0 if no fees have been collected.
+    pub fn get_collected_fees(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CollectedFees(token))
+            .unwrap_or(0)
+    }
 }
