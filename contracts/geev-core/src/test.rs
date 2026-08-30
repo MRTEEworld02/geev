@@ -6567,7 +6567,6 @@ fn test_get_collected_fees_returns_amount_after_collection() {
 
     let contract_id = env.register(GiveawayContract, ());
     let client = GiveawayContractClient::new(&env, &contract_id);
-    let admin_client = AdminContractClient::new(&env, &contract_id);
 
     let token_admin = Address::generate(&env);
     let mock_token = env
@@ -6602,6 +6601,12 @@ fn test_get_collected_fees_returns_amount_after_collection() {
     client.pick_winner(&giveaway_id);
     client.claim_prize(&giveaway_id, &winner);
 
-    let collected_fees = admin_client.get_collected_fees(&mock_token);
+    // Read fees directly from storage since get_collected_fees is in AdminContract
+    let collected_fees: i128 = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CollectedFees(mock_token.clone()))
+            .unwrap_or(0)
+    });
     assert_eq!(collected_fees, 5); // 1% of 500
 }

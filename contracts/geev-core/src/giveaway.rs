@@ -854,13 +854,4 @@ impl GiveawayContract {
             .get(&DataKey::Claimed(giveaway_id, winner))
             .unwrap_or(false)
     }
-
-    /// Read the accumulated fees collected for a specific token.
-    /// Returns 0 if no fees have been collected.
-    pub fn get_collected_fees(env: Env, token: Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::CollectedFees(token))
-            .unwrap_or(0)
-    }
 }
