@@ -6610,3 +6610,615 @@ fn test_get_collected_fees_returns_amount_after_collection() {
     });
     assert_eq!(collected_fees, 5); // 1% of 500
 }
+
+// ── Additional edge-case tests ────────────────────────────────────────────────
+
+/// `pick_winner` must emit a `GiveawayWinnerSelected` event whose data vec
+/// carries the correct `giveaway_id` and gross `prize_amount` (before the
+/// per-claim fee deduction).  The topics are `["giveaway", "winner", <winner>]`.
+#[test]
+fn test_pick_winner_emits_winner_selected_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, client, _tc, token, creator) = setup_giveaway_env(&env, 100); // 1 %
+
+    let amount: i128 = 500;
+    let giveaway_id = client.create_giveaway(
+        &creator,
+        &token,
+        &amount,
+        &String::from_str(&env, "Winner Event"),
+        &60,
+        &1,
+        &None,
+        &None, // fee_bps
+    );
+
+    let winner = Address::generate(&env);
+    client.enter_giveaway(&winner, &giveaway_id);
+    env.ledger().with_mut(|li| li.timestamp += 100);
+    client.pick_winner(&giveaway_id);
+
+    let events = env.events().all();
+    // Topics: symbol "giveaway", symbol "winner", winner address.
+    let expected_topics: soroban_sdk::Vec<Val> = vec![
+        &env,
+        Symbol::new(&env, "giveaway").into_val(&env),
+        Symbol::new(&env, "winner").into_val(&env),
+        winner.into_val(&env),
+    ];
+    assert!(
+        events.iter().any(|(ec, topics, data)| {
+            if ec != contract_id || topics != expected_topics.into_val(&env) {
+                return false;
+            }
+            let v: soroban_sdk::Vec<Val> = soroban_sdk::Vec::from_val(&env, &data);
+            let ev_giveaway_id = u64::from_val(&env, &v.get(0).unwrap());
+            // prize_amount is the gross share — equal to `amount` for a single winner.
+            let ev_prize = i128::from_val(&env, &v.get(1).unwrap());
+            ev_giveaway_id == giveaway_id && ev_prize == amount
+        }),
+        "GiveawayWinnerSelected event not found or fields do not match"
+    );
+}
+
+/// For a 3-winner giveaway where only winner-0 claims before the deadline,
+/// `recover_unclaimed_prize` must return exactly the two unclaimed gross shares
+/// to the creator with no fee deduction, and the contract must retain only the
+/// fee collected from the single successful claim.
+#[test]
+fn test_partial_claim_creator_receives_exact_unclaimed_gross_shares() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // 1 % fee so arithmetic is easy to track.
+    let (contract_id, client, tc, token, creator) = setup_giveaway_env(&env, 100);
+
+    // 3 winners, 300 tokens → 100 gross each (even split, no remainder).
+    let amount: i128 = 300;
+    let giveaway_id = client.create_giveaway(
+        &creator,
+        &token,
+        &amount,
+        &String::from_str(&env, "Partial 3-winner"),
+        &60,
+        &3,
+        &None,
+        &None, // fee_bps
+    );
+
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let p3 = Address::generate(&env);
+    client.enter_giveaway(&p1, &giveaway_id);
+    client.enter_giveaway(&p2, &giveaway_id);
+    client.enter_giveaway(&p3, &giveaway_id);
+    env.ledger().with_mut(|li| li.timestamp += 100);
+    client.pick_winner(&giveaway_id);
+
+    let winners: Vec<Address> = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Giveaway>(&DataKey::Giveaway(giveaway_id))
+            .unwrap()
+            .winners
+            .clone()
+    });
+
+    // Only winner-0 claims (gross share = 100, net = 99, fee = 1).
+    client.claim_prize(&giveaway_id, &winners.get(0).unwrap());
+    assert_eq!(tc.balance(&winners.get(0).unwrap()), 99);
+
+    let creator_before = tc.balance(&creator);
+
+    // Advance past claim window.
+    env.ledger()
+        .with_mut(|li| li.timestamp += 7 * 24 * 60 * 60 + 1);
+    client.recover_unclaimed_prize(&giveaway_id, &creator);
+
+    // Creator recovers the two unclaimed gross shares (100 + 100 = 200) — no fee.
+    assert_eq!(tc.balance(&creator) - creator_before, 200);
+
+    // Contract holds only the 1-token fee from the single claim.
+    assert_eq!(tc.balance(&contract_id), 1);
+
+    // Unclaiming winners received nothing.
+    assert_eq!(tc.balance(&winners.get(1).unwrap()), 0);
+    assert_eq!(tc.balance(&winners.get(2).unwrap()), 0);
+
+    // Giveaway is finalized.
+    env.as_contract(&contract_id, || {
+        let g: Giveaway = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Giveaway(giveaway_id))
+            .unwrap();
+        assert_eq!(g.status, GiveawayStatus::Completed);
+    });
+}
+
+// ── Emergency pause / circuit-breaker tests ───────────────────────────────────
+//
+// Coverage matrix (acceptance criteria):
+//   AC1  Admin can pause/unpause; non-admins cannot.
+//   AC2  Value-moving entrypoints panic with Error::ContractPaused while paused.
+//   AC3  admin_withdraw and unpause still work while paused.
+//   AC4  Pause state survives across calls; ContractPaused/Unpaused events emitted.
+
+/// Helper: register AdminContract with `admin` pre-seeded and return the client.
+fn setup_admin_contract(env: &Env) -> (Address, AdminContractClient<'_>, Address) {
+    let contract_id = env.register(AdminContract, ());
+    let client = AdminContractClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    });
+    (contract_id, client, admin)
+}
+
+// ── AC1: admin can pause ──────────────────────────────────────────────────────
+
+#[test]
+fn test_admin_can_pause_and_unpause() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, client, _admin) = setup_admin_contract(&env);
+
+    // Initially not paused.
+    env.as_contract(&contract_id, || {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        assert!(!paused);
+    });
+
+    client.pause();
+
+    env.as_contract(&contract_id, || {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        assert!(paused);
+    });
+
+    client.unpause();
+
+    env.as_contract(&contract_id, || {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        assert!(!paused);
+    });
+}
+
+#[test]
+#[should_panic]
+fn test_non_admin_cannot_pause() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Register without seeding an admin — check_admin will panic with NotAdmin.
+    let contract_id = env.register(AdminContract, ());
+    let client = AdminContractClient::new(&env, &contract_id);
+    client.pause();
+}
+
+#[test]
+#[should_panic]
+fn test_non_admin_cannot_unpause() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AdminContract, ());
+    let client = AdminContractClient::new(&env, &contract_id);
+    client.unpause();
+}
+
+// ── AC4: events are emitted on each transition ────────────────────────────────
+
+#[test]
+fn test_pause_emits_contract_paused_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, client, admin) = setup_admin_contract(&env);
+    client.pause();
+
+    // The #[contractevent] macro serialises fields as a Map<Symbol, Val>.
+    // ContractPaused has a single field `admin: Address`.
+    let events = env.events().all();
+    assert!(
+        events.iter().any(|(ec, topics, data)| {
+            if ec != contract_id {
+                return false;
+            }
+            // Topics: [Symbol("contract_paused")]
+            let topic_vec: soroban_sdk::Vec<Val> = soroban_sdk::Vec::from_val(&env, &topics);
+            if topic_vec.len() != 1 {
+                return false;
+            }
+            let topic_sym = soroban_sdk::Symbol::from_val(&env, &topic_vec.get(0).unwrap());
+            if topic_sym != soroban_sdk::Symbol::new(&env, "contract_paused") {
+                return false;
+            }
+            // Data: Map { "admin" => Address }
+            let map = soroban_sdk::Map::<soroban_sdk::Symbol, Address>::from_val(&env, &data);
+            map.get(soroban_sdk::Symbol::new(&env, "admin"))
+                .map(|a| a == admin)
+                .unwrap_or(false)
+        }),
+        "ContractPaused event with admin address not found"
+    );
+}
+
+#[test]
+fn test_unpause_emits_contract_unpaused_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, client, admin) = setup_admin_contract(&env);
+    client.pause();
+    client.unpause();
+
+    let events = env.events().all();
+    // ContractUnpaused has a single field `admin: Address`, same shape as ContractPaused.
+    assert!(
+        events.iter().any(|(ec, topics, data)| {
+            if ec != contract_id {
+                return false;
+            }
+            let topic_vec: soroban_sdk::Vec<Val> = soroban_sdk::Vec::from_val(&env, &topics);
+            if topic_vec.len() != 1 {
+                return false;
+            }
+            let topic_sym = soroban_sdk::Symbol::from_val(&env, &topic_vec.get(0).unwrap());
+            if topic_sym != soroban_sdk::Symbol::new(&env, "contract_unpaused") {
+                return false;
+            }
+            let map = soroban_sdk::Map::<soroban_sdk::Symbol, Address>::from_val(&env, &data);
+            map.get(soroban_sdk::Symbol::new(&env, "admin"))
+                .map(|a| a == admin)
+                .unwrap_or(false)
+        }),
+        "ContractUnpaused event with admin address not found"
+    );
+}
+
+// ── AC4: pause state persists across calls ────────────────────────────────────
+
+#[test]
+fn test_pause_state_persists_across_calls() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, client, _admin) = setup_admin_contract(&env);
+    client.pause();
+
+    // Simulate a separate "call" by re-reading storage from outside the closure.
+    env.as_contract(&contract_id, || {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        assert!(paused, "Paused flag did not survive across invocations");
+    });
+}
+
+// ── AC2: guarded entrypoints panic while paused ───────────────────────────────
+
+/// Set up a GiveawayContract with a whitelisted token and a funded creator,
+/// then pause via DataKey::Paused directly (no AdminContract needed).
+fn setup_paused_giveaway_contract(
+    env: &Env,
+) -> (Address, GiveawayContractClient<'_>, Address, Address) {
+    let contract_id = env.register(GiveawayContract, ());
+    let client = GiveawayContractClient::new(env, &contract_id);
+
+    let token_admin = Address::generate(env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    token::StellarAssetClient::new(env, &token).mint(&Address::generate(env), &0); // trigger init
+
+    let creator = Address::generate(env);
+    token::StellarAssetClient::new(env, &token).mint(&creator, &2000);
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedToken(token.clone()), &true);
+        env.storage().instance().set(&DataKey::Paused, &true);
+    });
+
+    (contract_id, client, token, creator)
+}
+
+#[test]
+fn test_create_giveaway_fails_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_contract_id, client, token, creator) = setup_paused_giveaway_contract(&env);
+
+    assert_eq!(
+        client.try_create_giveaway(
+            &creator,
+            &token,
+            &500,
+            &String::from_str(&env, "Paused Test"),
+            &60,
+            &1,
+            &None,
+            &None,
+        ),
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            Error::ContractPaused as u32
+        )))
+    );
+}
+
+#[test]
+fn test_create_giveaway_with_selection_fails_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_contract_id, client, token, creator) = setup_paused_giveaway_contract(&env);
+
+    assert_eq!(
+        client.try_create_giveaway_with_selection(
+            &creator,
+            &token,
+            &500,
+            &String::from_str(&env, "Paused Selection Test"),
+            &60,
+            &1,
+            &None,
+            &SelectionMethod::Random,
+            &None,
+        ),
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            Error::ContractPaused as u32
+        )))
+    );
+}
+
+#[test]
+fn test_enter_giveaway_fails_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, client, token, creator) = setup_paused_giveaway_contract(&env);
+
+    // Temporarily unpause to create a giveaway, then re-pause.
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Paused, &false);
+    });
+    token::StellarAssetClient::new(&env, &token).mint(&creator, &500);
+    let giveaway_id = client.create_giveaway(
+        &creator,
+        &token,
+        &500,
+        &String::from_str(&env, "Pause Entry Test"),
+        &60,
+        &1,
+        &None,
+        &None,
+    );
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Paused, &true);
+    });
+
+    let participant = Address::generate(&env);
+    assert_eq!(
+        client.try_enter_giveaway(&participant, &giveaway_id),
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            Error::ContractPaused as u32
+        )))
+    );
+}
+
+#[test]
+fn test_claim_prize_fails_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, client, token, creator) = setup_paused_giveaway_contract(&env);
+
+    // Unpause to run the full lifecycle, then re-pause before claim.
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Paused, &false);
+    });
+    token::StellarAssetClient::new(&env, &token).mint(&creator, &500);
+    let giveaway_id = client.create_giveaway(
+        &creator,
+        &token,
+        &500,
+        &String::from_str(&env, "Pause Claim Test"),
+        &60,
+        &1,
+        &None,
+        &None,
+    );
+    let winner = Address::generate(&env);
+    client.enter_giveaway(&winner, &giveaway_id);
+    env.ledger().with_mut(|li| li.timestamp += 100);
+    client.pick_winner(&giveaway_id);
+
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Paused, &true);
+    });
+
+    assert_eq!(
+        client.try_claim_prize(&giveaway_id, &winner),
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            Error::ContractPaused as u32
+        )))
+    );
+}
+
+#[test]
+fn test_donate_fails_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MutualAidContract, ());
+    let client = MutualAidContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    let creator = Address::generate(&env);
+    let donor = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token).mint(&donor, &500);
+
+    let request_id = client.post_help_request(&creator, &1, &1000, &token);
+
+    // Pause the contract.
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Paused, &true);
+    });
+
+    assert_eq!(
+        client.try_donate(&donor, &request_id, &100),
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            Error::ContractPaused as u32
+        )))
+    );
+}
+
+#[test]
+fn test_claim_help_request_funds_fails_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, client, _token, creator, request_id) = setup_funded_request(&env);
+
+    // Pause after funding.
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Paused, &true);
+    });
+
+    assert_eq!(
+        client.try_claim_help_request_funds(&creator, &request_id),
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            Error::ContractPaused as u32
+        )))
+    );
+}
+
+// ── AC3: escape hatches work while paused ────────────────────────────────────
+
+#[test]
+fn test_admin_withdraw_works_while_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, client, _admin) = setup_admin_contract(&env);
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    token::StellarAssetClient::new(&env, &token).mint(&contract_id, &1000);
+
+    let token_client = token::Client::new(&env, &token);
+    let safe = Address::generate(&env);
+
+    // Pause then withdraw.
+    client.pause();
+    client.admin_withdraw(&token, &1000, &safe);
+
+    assert_eq!(token_client.balance(&safe), 1000);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+#[test]
+fn test_unpause_works_while_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, client, _admin) = setup_admin_contract(&env);
+
+    client.pause();
+
+    // Must not panic.
+    client.unpause();
+
+    env.as_contract(&contract_id, || {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        assert!(!paused);
+    });
+}
+
+// ── AC2 (restored): unpausing restores normal operation ──────────────────────
+
+#[test]
+fn test_guarded_entrypoints_work_after_unpause() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(GiveawayContract, ());
+    let client = GiveawayContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let creator = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token).mint(&creator, &1000);
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedToken(token.clone()), &true);
+        // Pause first.
+        env.storage().instance().set(&DataKey::Paused, &true);
+    });
+
+    // Confirm create_giveaway is blocked.
+    assert!(client
+        .try_create_giveaway(
+            &creator,
+            &token,
+            &500,
+            &String::from_str(&env, "Should Fail"),
+            &60,
+            &1,
+            &None,
+            &None,
+        )
+        .is_err());
+
+    // Unpause.
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Paused, &false);
+    });
+
+    // Now create_giveaway should succeed.
+    let giveaway_id = client.create_giveaway(
+        &creator,
+        &token,
+        &500,
+        &String::from_str(&env, "After Unpause"),
+        &60,
+        &1,
+        &None,
+        &None,
+    );
+    assert_eq!(giveaway_id, 1);
+}
