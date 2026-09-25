@@ -54,7 +54,7 @@ function installFakePrisma(
   state: FakeState,
   readGate: () => Promise<void> = async () => {},
 ) {
-  const tx = {
+  const baseTx = {
     post: {
       findUnique: async () => {
         await readGate();
@@ -69,26 +69,6 @@ function installFakePrisma(
           winners: state.winners.map((w) => ({ ...w })),
         };
       },
-      // Compare-and-set on the status, exactly like the conditional
-      // updateMany in the route: only the first concurrent claim wins.
-      updateMany: async ({ data }: { data: { status: string } }) => {
-        if (state.status === "completed") return { count: 0 };
-        state.status = data.status;
-        return { count: 1 };
-      },
-    },
-    postWinner: {
-      count: async () => state.winners.length,
-      createMany: async ({ data }: { data: Array<{ userId: string }> }) => {
-        let created = 0;
-        for (const row of data) {
-          if (!state.winners.some((w) => w.userId === row.userId)) {
-            state.winners.push({ userId: row.userId });
-            created += 1;
-          }
-        }
-        return { count: created };
-      },
     },
     entry: {
       updateMany: async () => ({ count: 0 }),
@@ -96,15 +76,47 @@ function installFakePrisma(
   };
 
   prisma.$transaction = vi.fn(async (callback: any) => {
-    const snapshot = {
-      status: state.status,
-      winners: state.winners.map((w) => ({ ...w })),
+    // Roll back only what THIS transaction wrote, so a losing concurrent
+    // transaction cannot undo the winner's committed claim.
+    let claimedHere = false;
+    const addedWinners: string[] = [];
+
+    const tx = {
+      ...baseTx,
+      post: {
+        ...baseTx.post,
+        // Compare-and-set on the status, exactly like the conditional
+        // updateMany in the route: only the first concurrent claim wins.
+        updateMany: async ({ data }: { data: { status: string } }) => {
+          if (state.status === "completed") return { count: 0 };
+          state.status = data.status;
+          claimedHere = true;
+          return { count: 1 };
+        },
+      },
+      postWinner: {
+        count: async () => state.winners.length,
+        createMany: async ({ data }: { data: Array<{ userId: string }> }) => {
+          let created = 0;
+          for (const row of data) {
+            if (!state.winners.some((w) => w.userId === row.userId)) {
+              state.winners.push({ userId: row.userId });
+              addedWinners.push(row.userId);
+              created += 1;
+            }
+          }
+          return { count: created };
+        },
+      },
     };
+
     try {
       return await callback(tx);
     } catch (error) {
-      state.status = snapshot.status;
-      state.winners = snapshot.winners;
+      if (claimedHere) state.status = "open";
+      state.winners = state.winners.filter(
+        (w) => !addedWinners.includes(w.userId),
+      );
       throw error;
     }
   }) as any;
